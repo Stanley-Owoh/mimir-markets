@@ -66,6 +66,7 @@ sequenceDiagram
     participant H as Evidence Commitment (SHA-256)
     participant T as Confidence Tiers & Policy
     participant R as Settlement Submitter (Retry)
+    participant B as Retry Budget (per claim)
 
     Note over W: Cycle every ORACLE_POLL_INTERVAL_MS
     W->>C: getClaimCount()
@@ -75,6 +76,9 @@ sequenceDiagram
 
     loop For each expired claim (sorted by deadline)
         W->>R: settle(claim)
+        R->>B: budget = getOrCreateBudget(claimId)
+        R->>B: if budget.exhausted() -> skip claim this cycle
+        Note over B: Bounded evidence retries per claim (ORACLE_EVIDENCE_MAX_ATTEMPTS)
         R->>R: Check pauseState("oracle_settlement")
         R->>R: settlementSnapshotIsReady(claim)
 
@@ -87,6 +91,10 @@ sequenceDiagram
         end
         E-->>R: EvidenceResult (text, fetcher, failure)
         alt Evidence fetch failure
+            R->>B: budget.recordEvidenceFailure()
+            alt budget.exhausted()
+                Note over R: Mark claim as budget-exhausted; defer without monopolizing cycle
+            end
             Note over R: Defer claim to next poll (never refund on outage)
         end
 
@@ -157,12 +165,13 @@ sequenceDiagram
 ## Detailed Pipeline Stages
 
 ### 1. Poll & Claim Classification
-The worker loop in `agents/oracle/index.ts:830` polls every `ORACLE_POLL_INTERVAL_MS` (default `60000` ms).
+The worker loop in `agents/oracle/index.ts:830` polls every `ORACLE_POLL_INTERVAL_MS` (default `60000` ms), with jitter configured by `ORACLE_POLL_JITTER_MS` (default ±10%).
 - **Claim Batching:** Fetches total claim count via `getClaimCount()` and batches RPC reads in chunks of 50 via `readClaimsBatch(ids)`.
 - **Classification:** `classifyClaimsForOracle` filters claims into `expiredActive` (`state === "active"` and `deadline <= now`) and `challengeable` (`state === "open"`).
 - **Pre-Settlement Pause Check:** If `isPaused("oracle_settlement")` (`MIMIR_PAUSE_ORACLE_SETTLEMENT=1` or `MIMIR_PAUSE_ALL=1`), the loop clears the `expiredActive` queue immediately. No LLM queries, evidence purchases, or transactions occur.
 - **Deadline Sorting:** `expiredActive` claims are sorted in ascending order of deadline (`a.deadline - b.deadline`) so older expired claims settle first.
 - **Inter-Settlement Delay:** After resolving a claim, the loop waits `ORACLE_SETTLEMENT_DELAY_MS` (default `900000` ms / 15 minutes) before proceeding to the next claim to avoid transaction congestion.
+- **Per-Claim Retry Budget:** Before processing each claim, the loop consults the per-claim retry budget (`agents/oracle/retry-budget.ts`). A claim whose evidence-acquisition budget is exhausted is skipped for the remainder of the cycle so a single failing claim cannot monopolize the worker. The budget is reset when the claim is observed resolved, cancelled, or when the worker restarts.
 
 ### 2. Pre-Settlement Lifecycle Guards
 Before any computation or network requests, `settle(claim)` runs lightweight sanity checks:
@@ -180,6 +189,7 @@ Before any computation or network requests, `settle(claim)` runs lightweight san
   - HTTP 402 Payment Required: If a source requires payment and `paidFetch` is provided, `fetchViaHttp402` pays with a budgeted USDC transfer (`fetcher: "bot-paid"`).
   - Cloudflare / Scraped Fallback: If blocked by bot protection or if content is under 200 characters, falls back to Jina Reader (`https://r.jina.ai/URL`) (`fetcher: "jina"`).
 - **Outage Protection:** If evidence retrieval fails, `evidence.failure` is set. The oracle defers the claim to the next poll. **A fetch failure is never converted into an on-chain refund.**
+- **Bounded Evidence Retry Budget:** Evidence acquisition retries are tracked per claim in `agents/oracle/retry-budget.ts` and are strictly separated from transaction reconciliation retries (see [Stage 9](#9-on-chain-submission--bounded-retry)). Each failed evidence acquisition consumes one unit of the claim's budget, bounded by `ORACLE_EVIDENCE_MAX_ATTEMPTS` (default `3`). Once the budget is exhausted, the claim is skipped for the remainder of the worker cycle and re-eligible on the next poll; the budget is not shared across claims, so one failing claim cannot starve others.
 
 ### 4. Sports Finality & Grace Window
 Sports markets close betting at match kickoff, meaning the claim deadline is in the past while the match is still in progress:
@@ -244,6 +254,7 @@ In `lib/oracle/confidence-tiers.ts`:
 - **Error Classification & Backoff:** `classifySettlementError` categorizes errors:
   - `malformed`, `stale`, `duplicate`, `cancelled`, `paused`: Non-retryable; stops immediately.
   - `dependency-failure`: Retries up to `ORACLE_SETTLEMENT_TX_MAX_ATTEMPTS` (default `3`) using exponential backoff starting at `ORACLE_SETTLEMENT_TX_RETRY_BASE_MS` (default `1000` ms) up to `ORACLE_SETTLEMENT_TX_RETRY_MAX_MS` (default `15000` ms). If exhausted, defers to next poll.
+- **Separation from Evidence Retries:** Transaction reconciliation retries are governed solely by `ORACLE_SETTLEMENT_TX_MAX_ATTEMPTS` and the backoff knobs above. They do not consume, and are not consumed by, the per-claim evidence retry budget (`ORACLE_EVIDENCE_MAX_ATTEMPTS`). A claim may exhaust its evidence budget across polls while still receiving full transaction retry attempts once evidence is successfully acquired.
 
 ### 10. Post-Settlement Council Bonuses
 If self-resolving council was used and `COUNCIL_BONUS_USDC` > 0:
@@ -294,6 +305,7 @@ The oracle worker emits a decision evidence manifest alongside each settlement d
 | Evidence URL unreachable / 5xx / timeout | `dependency-failure` | Defer claim to next poll cycle | None |
 | Cloudflare bot interstitial | — | Fall back to Jina Reader markdown extraction | None |
 | Sports event in progress (< grace window) | — | Defer claim to subsequent poll cycle | None |
+| Evidence retry budget exhausted for claim | `budget-exhausted` | Skip claim for remainder of worker cycle; re-eligible next poll | None |
 | LLM structured output invalid / unparseable | `malformed` | Retry once with `VERDICT_RETRY_SUFFIX`; if still invalid, throw and defer | None |
 | Evidence contains lone surrogate / > 64 KiB | `invalid_encoding` / `evidence_too_large` | Commitment throws; settlement aborts, retried next poll | None |
 | Model confidence < 60% | `low-confidence` | Rewrite verdict to `UNRESOLVABLE` with `[LOW CONFIDENCE — refunded]` | Full refund to all stakers |
@@ -301,6 +313,23 @@ The oracle worker emits a decision evidence manifest alongside each settlement d
 | Claim already resolved on-chain | `duplicate` | Skip; log duplicate avoided | None (idempotent) |
 | Claim cancelled on-chain | `cancelled` | Skip; no settlement submitted | Contract refunds stakers |
 | Soroban RPC timeout / network failure | `dependency-failure` | Bounded exponential retry (up to max attempts), then defer to next poll | None until confirmed |
+
+---
+
+### Evidence Acquisition Failure Classes
+
+Evidence acquisition failures are recorded in oracle decision journals using bounded codes. Each code is a fixed, low-cardinality identifier so journal entries remain comparable across runs.
+
+| Failure Class Code | Condition | Journal Behavior | On-Chain Impact |
+|---|---|---|---|
+| `evidence_unavailable` | Source unreachable, 5xx, timeout, or all fetch routes exhausted | Recorded; claim deferred to next poll | None |
+| `evidence_stale` | Retrieved evidence older than `MAX_EVIDENCE_AGE_MS` (15 minutes) | Recorded; claim deferred and re-fetched | None |
+| `evidence_malformed` | Evidence body empty, undecodable, or contains unpaired UTF-16 surrogates | Recorded; claim deferred | None |
+| `evidence_unsupported` | Source format or content type not supported by any fetcher route | Recorded; claim deferred | None |
+
+Dependency-driven failures (`evidence_unavailable`, `evidence_stale`) follow the existing conservative skip-and-retry behavior. They are never converted into settled verdicts or refunds. `evidence_malformed` and `evidence_unsupported` likewise defer the claim rather than producing an `UNRESOLVABLE` outcome.
+
+Journal entries carry only the bounded code, the claim ID, the fetcher kind when known, and a timestamp. They do not include raw evidence text.
 
 ---
 

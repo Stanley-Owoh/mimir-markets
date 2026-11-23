@@ -213,6 +213,11 @@ export const REVIEWED_PACKAGE_SCRIPTS: Readonly<Record<string, ReviewedScriptSpe
   },
 
   // Release, security & verification gates
+  prepack: {
+    command: "node scripts/check-tracked-path-case.mjs",
+    category: "release",
+    supportsArgForwarding: false,
+  },
   "sbom:release": {
     command: "node scripts/generate-release-sbom.mjs",
     category: "release",
