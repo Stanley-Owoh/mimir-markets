@@ -60,6 +60,17 @@ and prints the evidence hash, verdict, tier, confidence and the transaction it
 would send. It never loads a signer and never builds a transaction for submission:
 passing `--submit` is refused. It needs only a public testnet RPC URL and an LLM key.
 
+### Comparing two oracle policies offline
+
+To compare a proposed confidence/grace-window change against the current oracle policy on the **same** captured evidence, use the credential-free comparison command:
+
+```
+npm run oracle:compare -- --fixture tests/fixtures/oracle-policy-compare/valid.json
+npm run oracle:compare -- --fixture <path> --json --out /tmp/oracle-compare/report.json
+```
+
+`npm run oracle:policy-compare` is an alias. The report lists only deterministic differences (changed action, outcome, reason, verdict, confidence, explanation and finality), with a per-case evidence digest proving both policies saw identical input. It needs no signer, RPC URL, LLM key, paid transport, or database, and refuses `--submit`. Policy bounds and the strict sports grace boundary are validated before anything is written; malformed fixtures exit `2`. See [`ORACLE_PIPELINE.md`](ORACLE_PIPELINE.md#dry-run-policy-comparison) for the fixture/report interface and focused coverage.
+
 ### Credential-free outage and recovery scenarios
 
 Run the deterministic scenarios before changing settlement handling or during an

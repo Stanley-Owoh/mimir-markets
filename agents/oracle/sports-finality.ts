@@ -34,9 +34,14 @@ export const SPORTS_EVIDENCE_MANIFEST_MAX_ITEMS = 20
 /** Maximum length of a retained source reference string. */
 export const SPORTS_EVIDENCE_SOURCE_REF_MAX_LEN = 256
 
+export function sportsGraceSecs(
+  hours: number | string = process.env.SPORTS_SETTLE_GRACE_HOURS ?? SPORTS_SETTLE_GRACE_HOURS_DEFAULT,
+): number {
+  return Math.max(1, Number(hours)) * 3600
+}
+
 /** Grace window in seconds, honoring SPORTS_SETTLE_GRACE_HOURS (default 12h). */
-export const SPORTS_SETTLE_GRACE_SECS =
-  Math.max(1, Number(process.env.SPORTS_SETTLE_GRACE_HOURS ?? SPORTS_SETTLE_GRACE_HOURS_DEFAULT)) * 3600
+export const SPORTS_SETTLE_GRACE_SECS = sportsGraceSecs()
 
 /** Claim fields the check needs. */
 export interface SportsClaim {
@@ -52,8 +57,13 @@ export interface SportsClaim {
  *   - evidence shows live / upcoming / postponed → false (defer)
  *   - anything unrecognised → false (defer; the safe default)
  */
-export function isSportsEventFinal(claim: SportsClaim, evidenceText: string, now: number): boolean {
-  const pastGrace = now > claim.deadline + SPORTS_SETTLE_GRACE_SECS
+export function isSportsEventFinal(
+  claim: SportsClaim,
+  evidenceText: string,
+  now: number,
+  graceSecs: number = SPORTS_SETTLE_GRACE_SECS,
+): boolean {
+  const pastGrace = now > claim.deadline + graceSecs
   if (pastGrace) return true
   return eventLooksFinal(evidenceText)
 }

@@ -27,6 +27,7 @@ This document also describes the oracle decision evidence manifest: a bounded, s
 - [Decision Evidence Manifest](#decision-evidence-manifest)
 - [Failure Handling Matrix](#failure-handling-matrix)
 - [Environment Configuration Knobs](#environment-configuration-knobs)
+- [Dry-run Policy Comparison](#dry-run-policy-comparison)
 
 ---
 
@@ -44,6 +45,8 @@ The settlement pipeline spans the following modules:
 | **Confidence Tiers** | `lib/oracle/confidence-tiers.ts` | Pure confidence tier thresholds (HIGH ≥ 80, MEDIUM 60–79 with `[CONTESTED]`, LOW < 60 refund) and non-API confidence capping at 75. |
 | **Unresolvable Policy** | `lib/oracle/unresolvable-policy.ts` | Explicit outcome determination (`firm`, `contested`, `draw`, `refund` with typed reasons). |
 | **Settlement Retry** | `lib/settlement-retry.ts` | Pure error classification (`malformed`, `stale`, `duplicate`, `cancelled`, `paused`, `dependency-failure`) and exponential backoff retry. |
+| **Policy Comparison** | `lib/oracle/policy-comparison.ts` | Pure replay of one captured-evidence fixture under two oracle policies; emits deterministic differences only. |
+| **Policy Compare CLI** | `scripts/oracle-policy-compare.ts` | Credential-free `npm run oracle:compare` wrapper over the comparison module. |
 | **Soroban Contract** | `contracts-soroban/mimir-market` | On-chain state transition to `resolved`, winner recording, and escrowing challenger payouts for pull-based redemption. |
 
 ---
@@ -186,6 +189,7 @@ Sports markets close betting at match kickoff, meaning the claim deadline is in 
 - **Finality Check:** While $\text{now} \le \text{deadline} + \text{grace}$, the oracle queries the LLM via `isSportsEventFinal(claim, evidence.text)`:
   - If the match is not definitively finished (`final: false`), settlement is deferred to a future poll.
   - If $\text{now} > \text{deadline} + \text{grace}$, the grace window has expired. The oracle proceeds with settlement to prevent permanently locked funds during extended data outages.
+  - `isSportsEventFinal(claim, evidence, now, graceSecs?)` accepts an explicit grace window in seconds. The worker omits it and uses `SPORTS_SETTLE_GRACE_SECS`; the dry-run comparison passes each policy's window explicitly so the environment cannot change its output. The boundary remains strict: exactly at `deadline + grace` still defers.
 
 ### 5. Verdict Generation (Solo vs. Council)
 Depending on `COUNCIL_SETTLEMENT`:
@@ -220,6 +224,7 @@ In `lib/oracle/confidence-tiers.ts`:
   - **HIGH (Confidence $\ge 80$):** Settles decisive outcome (`CREATOR_WINS` or `CHALLENGERS_WIN`).
   - **MEDIUM ($60 \le \text{Confidence} < 80$):** Settles decisive outcome with `[CONTESTED]` tag prefixed to summary.
   - **LOW (Confidence $< 60$):** Converted to `UNRESOLVABLE` with `[LOW CONFIDENCE — refunded]` tag. The contract returns all stakes with zero fees.
+  - `tierVerdictWithThresholds(verdict, { highMin, mediumMin })` and `applyFetcherTrustWithCap(verdict, fetcher, maxConfidence)` expose the same tiering with explicit bounds for offline comparisons. `tierVerdict` and `applyFetcherTrust` are unchanged wrappers with the production defaults.
 
 ### 8. Settlement Policy & Research Citations
 - **Settlement Policy:** `applySettlementPolicy` in `lib/oracle/unresolvable-policy.ts` assigns typed outcomes:
@@ -336,3 +341,39 @@ Every environment variable read directly or indirectly by `agents/oracle/index.t
 | `ORACLE_SETTLEMENT_TX_MAX_ATTEMPTS` | `3` | Maximum transaction submission attempts for dependency/RPC failures (clamped between 1 and 5). |
 | `ORACLE_SETTLEMENT_TX_RETRY_BASE_MS` | `1000` | Initial base backoff delay in milliseconds for settlement retry attempts. |
 | `ORACLE_SETTLEMENT_TX_RETRY_MAX_MS` | `15000` | Maximum backoff delay in milliseconds for settlement retry attempts. |
+
+---
+
+## Dry-run Policy Comparison
+
+The policy comparison command answers one question without touching funds: *would changing the oracle's confidence or sports-finality policy change any decision we already captured?* It replays the **same** synthetic evidence fixture under a baseline and a candidate policy and prints only the deterministic differences.
+
+```bash
+npm run oracle:compare -- --fixture tests/fixtures/oracle-policy-compare/valid.json
+npm run oracle:compare -- --fixture <path> --json --out /tmp/oracle-compare/report.json
+npm run oracle:policy-compare -- --fixture <path>
+```
+
+`npm run oracle:policy-compare` is an alias for the same command. Use `--help` for the full flag list. `--submit` is explicitly refused (`DRY_RUN_ONLY`, exit code `2`): this command never loads a Stellar signer, never calls an LLM, never fetches a resolution URL, and never buys evidence over x402. Policy values come from the fixture rather than the worker's environment, so identical fixture bytes produce an identical report on any machine.
+
+### Fixture interface (`schemaVersion: 1`)
+
+| Field | Type | Meaning |
+|---|---|---|
+| `cases[]` | array | Non-empty list of captured decisions. Order is preserved in the report. |
+| `cases[].name` | string | Stable label used in output; defaults to `case-N`. |
+| `cases[].claim` | `{ id, category, deadline }` | `deadline` is epoch **seconds**. `category: "sports"` enables the finality gate. |
+| `cases[].evidence` | `{ text, fetcher, sourceUrl?, capturedAt? }` | Captured response body (max 65,536 chars), one of `coingecko-api`, `direct`, `jina`, `bot-paid`, `none`; `capturedAt` is epoch **milliseconds**. |
+| `cases[].verdict` | `{ verdict, confidence, explanation }` | The verdict captured from the original evaluation. Confidence is kept verbatim so an out-of-range value still exercises the `invalid-confidence` refund path. |
+| `cases[].now` | number | Epoch seconds used by the sports grace check. |
+| `baseline`, `candidate` | policy objects | Distinct names plus optional `highMin`, `mediumMin`, `nonApiCap`, `sportsGraceHours`. Defaults match the worker: `80`, `60`, `75`, `12`. |
+
+Invalid policy bounds (`0 <= mediumMin < highMin <= 100`, `0 <= nonApiCap <= 100`, positive `sportsGraceHours`), unsupported schema versions, malformed JSON, duplicate policy names, and unsupported fetcher/verdict strings fail closed with a machine-readable code and exit code `2` before any output file is written.
+
+### Report interface
+
+Each row carries a `evidenceDigest` (SHA-256 of the canonical captured case), the decision under each policy, `changed`, and the exact `changedFields` that differ. The top-level report includes `schemaVersion`, `dryRun: true`, `signingPerformed: false`, `externalCalls: 0`, both resolved policies, and `changedCount` in stable fixture order. Whole reports are safe to commit to a PR and diff byte-for-byte.
+
+Sports rows respect the strict grace boundary: at exactly `deadline + sportsGraceHours × 3600` a non-final match still defers; one second later the candidate policy may settle. Non-sports rows go straight through fetcher trust capping, threshold tiering, and `applySettlementPolicy`, so an API verdict at `85` can move from `firm` to `contested` when `highMin` moves from `80` to `90`, and scraped evidence can move from `contested` to `refund` when `nonApiCap` falls below the candidate's medium threshold.
+
+Focused coverage: `tests/node/oracle-policy-compare.test.ts`, runnable with `npm run test:node -- oracle-policy-compare`. It asserts identical inputs under both policies, the grace-window boundary, no network transport, byte-identical CLI output into a temporary state directory, and the failure/boundary cases above.

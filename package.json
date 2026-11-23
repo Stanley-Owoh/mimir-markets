@@ -7,6 +7,8 @@
   },
   "scripts": {
     "oracle:scenarios": "tsx scripts/oracle-outage-scenarios.ts",
+    "oracle:compare": "tsx scripts/oracle-policy-compare.ts",
+    "oracle:policy-compare": "tsx scripts/oracle-policy-compare.ts",
     "dev": "next dev",
     "dev:clean": "rm -rf .next && next dev",
     "clean": "rm -rf .next",
